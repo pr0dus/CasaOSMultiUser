@@ -3,34 +3,36 @@
 package main
 
 import (
-	"context"
-	_ "embed"
-	"flag"
-	"fmt"
-	"net"
-	"net/http"
-	"path/filepath"
-	"time"
+    "context"
+    _ "embed"
+    "flag"
+    "fmt"
+    "net"
+    "net/http"
+    "path/filepath"
+    "time"
 
-	"github.com/IceWhaleTech/CasaOS-Common/model"
-	"github.com/IceWhaleTech/CasaOS-Common/utils/command"
-	"github.com/IceWhaleTech/CasaOS-Common/utils/constants"
-	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
+    "github.com/IceWhaleTech/CasaOS-Common/model"
+    "github.com/IceWhaleTech/CasaOS-Common/utils/command"
+    "github.com/IceWhaleTech/CasaOS-Common/utils/constants"
+    "github.com/IceWhaleTech/CasaOS-Common/utils/logger"
 
-	util_http "github.com/IceWhaleTech/CasaOS-Common/utils/http"
+    util_http "github.com/IceWhaleTech/CasaOS-Common/utils/http"
 
-	"github.com/IceWhaleTech/CasaOS/common"
-	"github.com/IceWhaleTech/CasaOS/pkg/cache"
-	"github.com/IceWhaleTech/CasaOS/pkg/config"
-	"github.com/IceWhaleTech/CasaOS/pkg/sqlite"
-	"github.com/IceWhaleTech/CasaOS/pkg/utils/file"
-	"github.com/IceWhaleTech/CasaOS/route"
-	"github.com/IceWhaleTech/CasaOS/service"
-	"github.com/coreos/go-systemd/daemon"
-	"go.uber.org/zap"
+    "github.com/IceWhaleTech/CasaOS/common"
+    "github.com/IceWhaleTech/CasaOS/pkg/cache"
+    "github.com/IceWhaleTech/CasaOS/pkg/config"
+    "github.com/IceWhaleTech/CasaOS/pkg/sqlite"
+    "github.com/IceWhaleTech/CasaOS/pkg/utils/file"
+    "github.com/IceWhaleTech/CasaOS/route"
+    "github.com/IceWhaleTech/CasaOS/service"
+    "github.com/IceWhaleTech/CasaOS/controllers"  // Add this line
+    "github.com/IceWhaleTech/CasaOS/middleware"    // Add this line
+    "github.com/coreos/go-systemd/daemon"
+    "go.uber.org/zap"
 
-	"github.com/robfig/cron/v3"
-	"gorm.io/gorm"
+    "github.com/robfig/cron/v3"
+    "gorm.io/gorm"
 )
 
 const LOCALHOST = "127.0.0.1"
@@ -100,130 +102,134 @@ func init() {
 // @in header
 // @name Authorization
 // @BasePath /v1
+
 func main() {
-	if *versionFlag {
-		return
-	}
-	v1Router := route.InitV1Router()
+    if *versionFlag {
+        return
+    }
+    v1Router := route.InitV1Router()
 
-	v2Router := route.InitV2Router()
-	v2DocRouter := route.InitV2DocRouter(_docHTML, _docYAML)
-	v3File := route.InitFile()
-	mux := &util_http.HandlerMultiplexer{
-		HandlerMap: map[string]http.Handler{
-			"v1":  v1Router,
-			"v2":  v2Router,
-			"v3":  v3File,
-			"doc": v2DocRouter,
-		},
-	}
+    // Add user management routes
+    v1Router.HandleFunc("/api/users", controllers.CreateUser).Methods("POST")
+    v1Router.HandleFunc("/api/users", controllers.GetUser).Methods("GET")
+    v1Router.HandleFunc("/api/users", controllers.DeleteUser).Methods("DELETE")
 
-	crontab := cron.New(cron.WithSeconds())
-	if _, err := crontab.AddFunc("@every 5s", route.SendAllHardwareStatusBySocket); err != nil {
-		logger.Error("add crontab error", zap.Error(err))
-	}
+    // Add middleware for protected routes
+    protectedRoutes := v1Router.PathPrefix("/api").Subrouter()
+    protectedRoutes.Use(middleware.AuthMiddleware)
 
-	crontab.Start()
-	defer crontab.Stop()
+    v2Router := route.InitV2Router()
+    v2DocRouter := route.InitV2DocRouter(_docHTML, _docYAML)
+    v3File := route.InitFile()
+    mux := &util_http.HandlerMultiplexer{
+        HandlerMap: map[string]http.Handler{
+            "v1":  v1Router,
+            "v2":  v2Router,
+            "v3":  v3File,
+            "doc": v2DocRouter,
+        },
+    }
 
-	listener, err := net.Listen("tcp", net.JoinHostPort(LOCALHOST, "0"))
-	if err != nil {
-		panic(err)
-	}
-	routers := []string{
-		"/v1/sys",
-		"/v1/port",
-		"/v1/file",
-		"/v1/folder",
-		"/v1/batch",
-		"/v1/image",
-		"/v1/samba",
-		"/v1/notify",
-		"/v1/driver",
-		"/v1/cloud",
-		"/v1/recover",
-		"/v1/other",
-		"/v1/zt",
-		"/v1/test",
-		route.V2APIPath,
-		route.V2DocPath,
-		route.V3FilePath,
-	}
-	for _, apiPath := range routers {
-		err = service.MyService.Gateway().CreateRoute(&model.Route{
-			Path:   apiPath,
-			Target: "http://" + listener.Addr().String(),
-		})
-		if err != nil {
-			fmt.Println("err", err)
-			panic(err)
-		}
-	}
+    crontab := cron.New(cron.WithSeconds())
+    if _, err := crontab.AddFunc("@every 5s", route.SendAllHardwareStatusBySocket); err != nil {
+        logger.Error("add crontab error", zap.Error(err))
+    }
 
-	// register at message bus
-	for i := 0; i < 10; i++ {
-		response, err := service.MyService.MessageBus().RegisterEventTypesWithResponse(context.Background(), common.EventTypes)
-		if err != nil {
-			logger.Error("error when trying to register one or more event types - some event type will not be discoverable", zap.Error(err))
-		}
-		if response != nil && response.StatusCode() != http.StatusOK {
-			logger.Error("error when trying to register one or more event types - some event type will not be discoverable", zap.String("status", response.Status()), zap.String("body", string(response.Body)))
-		}
-		if response.StatusCode() == http.StatusOK {
-			break
-		}
-		time.Sleep(time.Second)
-	}
+    crontab.Start()
+    defer crontab.Stop()
 
-	go func() {
-		time.Sleep(time.Second * 2)
-		// v0.3.6
-		if config.ServerInfo.HttpPort != "" {
-			changePort := model.ChangePortRequest{}
-			changePort.Port = config.ServerInfo.HttpPort
-			err := service.MyService.Gateway().ChangePort(&changePort)
-			if err == nil {
-				config.Cfg.Section("server").Key("HttpPort").SetValue("")
-				config.Cfg.SaveTo(config.SystemConfigInfo.ConfigPath)
-			}
-		}
-	}()
+    listener, err := net.Listen("tcp", net.JoinHostPort(LOCALHOST, "0"))
+    if (err != nil) {
+        panic(err)
+    }
+    routers := []string{
+        "/v1/sys",
+        "/v1/port",
+        "/v1/file",
+        "/v1/folder",
+        "/v1/batch",
+        "/v1/image",
+        "/v1/samba",
+        "/v1/notify",
+        "/v1/driver",
+        "/v1/cloud",
+        "/v1/recover",
+        "/v1/other",
+        "/v1/zt",
+        "/v1/test",
+        route.V2APIPath,
+        route.V2DocPath,
+        route.V3FilePath,
+    }
+    for _, apiPath := range routers {
+        err = service.MyService.Gateway().CreateRoute(&model.Route{
+            Path:   apiPath,
+            Target: "http://" + listener.Addr().String(),
+        })
+        if err != nil {
+            fmt.Println("err", err)
+            panic(err)
+        }
+    }
 
-	urlFilePath := filepath.Join(config.CommonInfo.RuntimePath, "casaos.url")
-	if err := file.CreateFileAndWriteContent(urlFilePath, "http://"+listener.Addr().String()); err != nil {
-		logger.Error("error when creating address file", zap.Error(err),
-			zap.Any("address", listener.Addr().String()),
-			zap.Any("filepath", urlFilePath),
-		)
-	}
+    // register at message bus
+    for i := 0; i < 10; i++ {
+        response, err := service.MyService.MessageBus().RegisterEventTypesWithResponse(context.Background(), common.EventTypes)
+        if err != nil {
+            logger.Error("error when trying to register one or more event types - some event type will not be discoverable", zap.Error(err))
+        }
+        if response != nil && response.StatusCode() != http.StatusOK {
+            logger.Error("error when trying to register one or more event types - some event type will not be discoverable", zap.String("status", response.Status()), zap.String("body", string(response.Body)))
+        }
+        if response.StatusCode() == http.StatusOK {
+            break
+        }
+        time.Sleep(time.Second)
+    }
 
-	// run any script that needs to be executed
-	scriptDirectory := filepath.Join(constants.DefaultConfigPath, "start.d")
-	command.ExecuteScripts(scriptDirectory)
+    go func() {
+        time.Sleep(time.Second * 2)
+        // v0.3.6
+        if config.ServerInfo.HttpPort != "" {
+            changePort := model.ChangePortRequest{}
+            changePort.Port = config.ServerInfo.HttpPort
+            err := service.MyService.Gateway().ChangePort(&changePort)
+            if err == nil {
+                config.Cfg.Section("server").Key("HttpPort").SetValue("")
+                config.Cfg.SaveTo(config.SystemConfigInfo.ConfigPath)
+            }
+        }
+    }()
 
-	if supported, err := daemon.SdNotify(false, daemon.SdNotifyReady); err != nil {
-		logger.Error("Failed to notify systemd that casaos main service is ready", zap.Any("error", err))
-	} else if supported {
-		logger.Info("Notified systemd that casaos main service is ready")
-	} else {
-		logger.Info("This process is not running as a systemd service.")
-	}
-	// http.HandleFunc("/v1/file/test", func(w http.ResponseWriter, r *http.Request) {
+    urlFilePath := filepath.Join(config.CommonInfo.RuntimePath, "casaos.url")
+    if err := file.CreateFileAndWriteContent(urlFilePath, "http://"+listener.Addr().String()); err != nil {
+        logger.Error("error when creating address file", zap.Error(err),
+            zap.Any("address", listener.Addr().String()),
+            zap.Any("filepath", urlFilePath),
+        )
+    }
 
-	// 	//http.ServeFile(w, r, r.URL.Path[1:])
-	// 	http.ServeFile(w, r, "/DATA/test.img")
-	// })
-	// go http.ListenAndServe(":8081", nil)
+    // run any script that needs to be executed
+    scriptDirectory := filepath.Join(constants.DefaultConfigPath, "start.d")
+    command.ExecuteScripts(scriptDirectory)
 
-	s := &http.Server{
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second, // fix G112: Potential slowloris attack (see https://github.com/securego/gosec)
-	}
+    if supported, err := daemon.SdNotify(false, daemon.SdNotifyReady); err != nil {
+        logger.Error("Failed to notify systemd that casaos main service is ready", zap.Any("error", err))
+    } else if supported {
+        logger.Info("Notified systemd that casaos main service is ready")
+    } else {
+        logger.Info("This process is not running as a systemd service.")
+    }
 
-	logger.Info("CasaOS main service is listening...", zap.Any("address", listener.Addr().String()))
-	// defer service.MyService.Storage().UnmountAllStorage()
-	err = s.Serve(listener) // not using http.serve() to fix G114: Use of net/http serve function that has no support for setting timeouts (see https://github.com/securego/gosec)
-	if err != nil {
-		panic(err)
-	}
+    s := &http.Server{
+        Handler:           mux,
+        ReadHeaderTimeout: 5 * time.Second, // fix G112: Potential slowloris attack (see https://github.com/securego/gosec)
+    }
+
+    logger.Info("CasaOS main service is listening...", zap.Any("address", listener.Addr().String()))
+    // defer service.MyService.Storage().UnmountAllStorage()
+    err = s.Serve(listener) // not using http.serve() to fix G114: Use of net/http serve function that has no support for setting timeouts (see https://github.com/securego/gosec)
+    if err != nil {
+        panic(err)
+    }
 }
